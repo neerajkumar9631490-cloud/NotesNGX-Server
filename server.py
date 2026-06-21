@@ -1,57 +1,38 @@
 #!/usr/bin/env python3
 """
 Notes NGX Backend Server
-========================
-Fetches PDF notes from a private GitHub repository and serves them via API.
-
-REQUIRED SETUP:
----------------
-1. Get GitHub Fine-Grained PAT from https://github.com/settings/tokens?type=beta
-   - Repository access: Select your private repo
-   - Permissions: Contents → Read-only
-
-2. Fill in the 4 CONFIG values below.
-
-3. Repo folder structure MUST be:
-   your-repo/
-   ├── physics/
-   │   └── (PDF files here)
-   ├── chemistry/
-   │   └── (PDF files here)
-   └── mathematics/
-       └── (PDF files here)
-
-4. pip install flask flask-cors requests
-5. python server.py
+Serves HTML pages AND provides API for PDF notes
+Includes built-in keep-alive to prevent Render from sleeping
 """
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIG — FILL THESE IN WITH YOUR VALUES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-GITHUB_TOKEN  = "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"  # ← PASTE YOUR FULL github_pat_ TOKEN
-GITHUB_OWNER  = "neerajkumar9631490-cloud"                  # ← YOUR GITHUB USERNAME
-GITHUB_REPO   = "NotesNGX-Server"                           # ← YOUR PRIVATE REPO NAME (exact from URL)
-GITHUB_BRANCH = "main"                                       # ← branch name (main or master)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SERVER CODE — DON'T EDIT BELOW UNLESS YOU KNOW WHAT YOU'RE DOING
-# ═══════════════════════════════════════════════════════════════════════════════
-
 import os
+import time
+import threading
 import requests
 from urllib.parse import quote
-from flask import Flask, jsonify, Response
+from flask import Flask, jsonify, Response, send_from_directory
 from flask_cors import CORS
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='.')
 CORS(app)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIG — From environment variables (set in Render dashboard)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "neerajkumar9631490-cloud")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "NotesNGX-Server")
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+RENDER_URL = os.environ.get("RENDER_URL", "http://localhost:5000")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GITHUB API FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 API_BASE = "https://api.github.com"
 RAW_BASE = "https://raw.githubusercontent.com"
 
-# Detect token type and set correct auth header format
-# github_pat_xxx tokens use "token" prefix, ghp_xxx tokens use "Bearer" prefix
 if GITHUB_TOKEN.startswith("github_pat_"):
     AUTH_HEADER = f"token {GITHUB_TOKEN}"
 else:
@@ -63,26 +44,50 @@ HEADERS = {
     "X-GitHub-Api-Version": "2026-03-10"
 }
 
-
 def github_api_get(path):
     """Make authenticated GET request to GitHub API."""
     url = f"{API_BASE}{path}"
     resp = requests.get(url, headers=HEADERS, timeout=30)
     if resp.status_code == 401:
-        return {"error": "Invalid GitHub token. Check your GITHUB_TOKEN.", "status": 401}, 401
+        return {"error": "Invalid GitHub token.", "status": 401}, 401
     if resp.status_code == 404:
-        return {"error": f"Not found: {path}. Check owner/repo/branch/folder names.", "status": 404}, 404
+        return {"error": f"Not found: {path}", "status": 404}, 404
     if resp.status_code == 403:
         return {"error": "GitHub API rate limit hit or token lacks permissions.", "status": 403}, 403
     resp.raise_for_status()
     return resp.json(), 200
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SERVE STATIC HTML PAGES
+# ═══════════════════════════════════════════════════════════════════════════════
 
-@app.route("/api/notes/<subject>")
+@app.route('/')
+def index():
+    """Serve the main index.html page"""
+    return send_from_directory('.', 'index.html')
+
+@app.route('/<path:path>')
+def serve_static(path):
+    """Serve all static files (HTML, CSS, images)"""
+    # Skip API routes
+    if path.startswith('api/'):
+        return jsonify({"error": "Not found"}), 404
+    
+    # Serve static files
+    try:
+        return send_from_directory('.', path)
+    except:
+        return jsonify({"error": "File not found"}), 404
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# API ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route('/api/notes/<subject>')
 def list_notes(subject):
     """
     List all PDF files in a subject folder from GitHub.
-    Returns JSON with files array. If folder doesn't exist or is empty, returns empty files array.
+    Returns JSON with files array.
     """
     subject = subject.lower().strip()
     valid_subjects = {"physics", "chemistry", "mathematics"}
@@ -96,7 +101,6 @@ def list_notes(subject):
     data, status = github_api_get(path)
 
     if status == 404:
-        # Folder doesn't exist → return empty with message
         return jsonify({
             "subject": subject,
             "count": 0,
@@ -107,7 +111,6 @@ def list_notes(subject):
     if status != 200:
         return jsonify(data), status
 
-    # data is a list of items in the folder
     files = []
     for item in data:
         if item.get("type") == "file" and item.get("name", "").lower().endswith(".pdf"):
@@ -127,8 +130,7 @@ def list_notes(subject):
         "message": "Notes loaded successfully" if files else "No PDFs found. Notes coming soon!"
     })
 
-
-@app.route("/api/download/<subject>/<path:filename>")
+@app.route('/api/download/<subject>/<path:filename>')
 def download_note(subject, filename):
     """
     Download/serve a specific PDF file from GitHub.
@@ -160,8 +162,7 @@ def download_note(subject, filename):
         }
     )
 
-
-@app.route("/api/health")
+@app.route('/api/health')
 def health():
     """Health check + verify GitHub token works."""
     url = f"{API_BASE}/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
@@ -174,56 +175,114 @@ def health():
             "github_connected": True,
             "repo": repo_data.get("full_name"),
             "private": repo_data.get("private"),
-            "default_branch": repo_data.get("default_branch")
+            "default_branch": repo_data.get("default_branch"),
+            "server": "running",
+            "keep_alive": "active"
         })
     else:
         return jsonify({
             "status": "error",
             "github_connected": False,
-            "message": f"GitHub API returned {resp.status_code}: {resp.text[:200]}"
+            "message": f"GitHub API returned {resp.status_code}"
         }), 500
 
-
-@app.route("/")
-def index():
-    """Root endpoint with API documentation."""
+@app.route('/api/info')
+def info():
+    """Get server information"""
     return jsonify({
         "service": "Notes NGX API",
+        "version": "1.0.0",
         "endpoints": {
-            "GET /api/health": "Check server + GitHub connection",
-            "GET /api/notes/<subject>": "List PDFs (physics/chemistry/mathematics)",
-            "GET /api/download/<subject>/<filename>": "Download a PDF file"
+            "/": "Main page (index.html)",
+            "/<page>": "Serve static pages (about, support, etc.)",
+            "/api/health": "Check server + GitHub connection",
+            "/api/info": "Server information",
+            "/api/notes/<subject>": "List PDFs (physics/chemistry/mathematics)",
+            "/api/download/<subject>/<filename>": "Download a PDF file"
         },
-        "example_calls": [
-            "http://localhost:5000/api/notes/physics",
-            "http://localhost:5000/api/download/physics/Kinematics.pdf"
-        ]
+        "subjects": ["physics", "chemistry", "mathematics"],
+        "keep_alive": {
+            "status": "active",
+            "interval": "10 minutes",
+            "target": RENDER_URL
+        }
     })
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# KEEP-ALIVE FUNCTION (Prevents Render from sleeping)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def keep_alive():
+    """
+    Keep the server alive by pinging itself every 10 minutes.
+    Prevents Render from putting the server to sleep after 15 minutes of inactivity.
+    """
+    # Wait 5 minutes before starting (give server time to fully start)
+    time.sleep(300)
+    
+    # Use the Render URL or localhost
+    url = RENDER_URL if "render.com" in RENDER_URL else "https://notes-ngx-server.onrender.com"
+    
+    # Remove trailing slash
+    if url.endswith('/'):
+        url = url[:-1]
+    
+    health_url = f"{url}/api/health"
+    
+    print(f"🔄 Keep-alive started! Pinging {health_url} every 10 minutes...")
+    
+    while True:
+        try:
+            response = requests.get(health_url, timeout=10)
+            if response.status_code == 200:
+                print(f"✅ Keep-alive ping successful at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                print(f"⚠️ Keep-alive ping returned status: {response.status_code}")
+        except Exception as e:
+            print(f"❌ Keep-alive ping failed: {str(e)}")
+        
+        # Wait 10 minutes (600 seconds)
+        time.sleep(600)
+
+def start_keep_alive():
+    """Start keep-alive in a separate thread so it doesn't block the server"""
+    thread = threading.Thread(target=keep_alive, daemon=True)
+    thread.start()
+    print("✅ Keep-alive thread started!")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN - START THE SERVER
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    if "YOUR_TOKEN" in GITHUB_TOKEN or not GITHUB_TOKEN or len(GITHUB_TOKEN) < 20:
+    # Check if GitHub token is set
+    if not GITHUB_TOKEN or len(GITHUB_TOKEN) < 20:
         print("\n" + "="*60)
-        print("❌ ERROR: You must set your GITHUB_TOKEN in server.py!")
+        print("❌ ERROR: You must set your GITHUB_TOKEN environment variable!")
         print("="*60)
         print("Get your token from: https://github.com/settings/tokens?type=beta")
+        print("Then set it in Render dashboard under Environment Variables")
+        print("="*60 + "\n")
         exit(1)
-
-    if GITHUB_OWNER == "neerajkumar9631490-cloud":
-        print("\n⚠️  WARNING: Using default owner. Make sure this is YOUR username!")
-
-    if GITHUB_REPO == "NotesNGX-Server":
-        print("\n⚠️  WARNING: Using default repo name. Make sure this matches YOUR repo!")
 
     print("\n" + "="*60)
     print("🚀 Notes NGX Server Starting...")
     print("="*60)
     print(f"   GitHub: {GITHUB_OWNER}/{GITHUB_REPO} ({GITHUB_BRANCH})")
-    print(f"   Token:  {GITHUB_TOKEN[:20]}... ({'Fine-Grained PAT' if GITHUB_TOKEN.startswith('github_pat_') else 'Classic PAT'})")
+    print(f"   Token:  {GITHUB_TOKEN[:20]}...")
+    print(f"   Render URL: {RENDER_URL}")
     print("="*60)
+    print("   http://localhost:5000/")
     print("   http://localhost:5000/api/health")
     print("   http://localhost:5000/api/notes/physics")
-    print("   http://localhost:5000/api/download/physics/filename.pdf")
+    print("   http://localhost:5000/api/info")
+    print("="*60)
+    print("🔄 Keep-alive will ping every 10 minutes to prevent sleeping")
     print("="*60 + "\n")
 
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Start the keep-alive thread
+    start_keep_alive()
+
+    # Start the Flask server
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
