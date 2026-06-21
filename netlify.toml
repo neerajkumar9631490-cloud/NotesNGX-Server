@@ -1,0 +1,9 @@
+[build]
+  command = "pip install -r requirements.txt"
+  publish = "."
+
+[build.environment]
+  PYTHON_VERSION = "3.10.12"
+
+[functions]
+  directory = "functions"
